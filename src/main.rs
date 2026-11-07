@@ -6,8 +6,8 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 use windows_sys::Win32::Foundation::{
-    COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT,
-    POINT, RECT, WPARAM,
+    COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND,
+    LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Security::{
@@ -15,6 +15,10 @@ use windows_sys::Win32::Security::{
     TokenElevationType, TokenElevationTypeDefault, TokenElevationTypeFull,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD,
+    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
     OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
@@ -33,10 +37,13 @@ const RUSSIAN: u16 = 0x0419;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const SHOW_TRAY_MESSAGE: u32 = WM_APP + 2;
 const SWITCH_LAYOUT_MESSAGE: u32 = WM_APP + 3;
-const TOGGLE_ID: usize = 1001;
 const EXIT_ID: usize = 1002;
 const HIDE_ID: usize = 1003;
 const AUTOSTART_ID: usize = 1004;
+const CAPS_DEFAULT_ID: usize = 1005;
+const CAPS_SWITCH_ID: usize = 1006;
+const FLAG_US_ID: usize = 1007;
+const FLAG_UK_ID: usize = 1008;
 const MAX_LAYOUTS: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -45,6 +52,7 @@ static TRAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static CURRENT_ICON: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static CURRENT_LANGUAGE: AtomicU16 = AtomicU16::new(0);
+static ENGLISH_FLAG_SETTING: AtomicU16 = AtomicU16::new(0);
 
 fn next_language(current: u16, available: &[u16]) -> Option<u16> {
     let target = if current == RUSSIAN { ENGLISH } else { RUSSIAN };
@@ -147,6 +155,15 @@ unsafe fn fill_rect(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color
     DeleteObject(brush);
 }
 
+unsafe fn draw_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, width: i32, color: COLORREF) {
+    let pen = CreatePen(PS_SOLID, width, color);
+    let previous = SelectObject(dc, pen);
+    MoveToEx(dc, x1, y1, null_mut());
+    LineTo(dc, x2, y2);
+    SelectObject(dc, previous);
+    DeleteObject(pen);
+}
+
 unsafe fn create_flag_icon(language: u16) -> HICON {
     let width = flag_width(GetSystemMetrics(SM_CXICON));
     let height = GetSystemMetrics(SM_CYICON);
@@ -161,6 +178,18 @@ unsafe fn create_flag_icon(language: u16) -> HICON {
         fill_rect(dc, 0, 0, width, height / 3, 0x00ff_ffff);
         fill_rect(dc, 0, height / 3, width, height * 2 / 3, 0x00a6_3900);
         fill_rect(dc, 0, height * 2 / 3, width, height, 0x001e_2bd5);
+    } else if is_uk_flag(ENGLISH_FLAG_SETTING.load(Ordering::Relaxed) as u32) {
+        fill_rect(dc, 0, 0, width, height, 0x0069_2101);
+        let diagonal_white = (width / 6).max(2);
+        let diagonal_red = (width / 12).max(1);
+        for (x1, y1, x2, y2) in [(0, 0, width, height), (width, 0, 0, height)] {
+            draw_line(dc, x1, y1, x2, y2, diagonal_white, 0x00ff_ffff);
+            draw_line(dc, x1, y1, x2, y2, diagonal_red, 0x002e_10c8);
+        }
+        fill_rect(dc, width * 3 / 8, 0, width * 5 / 8, height, 0x00ff_ffff);
+        fill_rect(dc, 0, height * 3 / 8, width, height * 5 / 8, 0x00ff_ffff);
+        fill_rect(dc, width * 7 / 16, 0, width * 9 / 16, height, 0x002e_10c8);
+        fill_rect(dc, 0, height * 7 / 16, width, height * 9 / 16, 0x002e_10c8);
     } else {
         let stripe_height = (height + 12) / 13;
         for stripe in 0..13 {
@@ -255,20 +284,52 @@ unsafe fn hide_tray(window: HWND) {
 
 unsafe fn show_menu(window: HWND) {
     let menu = CreatePopupMenu();
-    if menu.is_null() {
+    let behavior_menu = CreatePopupMenu();
+    let flag_menu = CreatePopupMenu();
+    if menu.is_null() || behavior_menu.is_null() || flag_menu.is_null() {
         return;
     }
-    let state = if ENABLED.load(Ordering::Relaxed) {
-        MF_STRING | MF_CHECKED
-    } else {
-        MF_STRING
-    };
+
+    let enabled = ENABLED.load(Ordering::Relaxed);
+    AppendMenuW(
+        behavior_menu,
+        MF_STRING | if enabled { 0 } else { MF_CHECKED },
+        CAPS_DEFAULT_ID,
+        wide("CapsLock по умолчанию").as_ptr(),
+    );
+    AppendMenuW(
+        behavior_menu,
+        MF_STRING | if enabled { MF_CHECKED } else { 0 },
+        CAPS_SWITCH_ID,
+        wide("Изменение раскладки").as_ptr(),
+    );
     AppendMenuW(
         menu,
-        state,
-        TOGGLE_ID,
-        wide("Переключать раскладку").as_ptr(),
+        MF_POPUP,
+        behavior_menu as usize,
+        wide("Поведение кнопки CapsLock").as_ptr(),
     );
+
+    let uk = is_uk_flag(ENGLISH_FLAG_SETTING.load(Ordering::Relaxed) as u32);
+    AppendMenuW(
+        flag_menu,
+        MF_STRING | if uk { 0 } else { MF_CHECKED },
+        FLAG_US_ID,
+        wide("США").as_ptr(),
+    );
+    AppendMenuW(
+        flag_menu,
+        MF_STRING | if uk { MF_CHECKED } else { 0 },
+        FLAG_UK_ID,
+        wide("Великобритания").as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        flag_menu as usize,
+        wide("Флаг английской раскладки").as_ptr(),
+    );
+
     AppendMenuW(menu, MF_STRING, HIDE_ID, wide("Скрыть из трея").as_ptr());
     AppendMenuW(
         menu,
@@ -320,11 +381,19 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_COMMAND => match wparam & 0xffff {
-            TOGGLE_ID => {
-                ENABLED.fetch_xor(true, Ordering::Relaxed);
-                if !ENABLED.load(Ordering::Relaxed) {
-                    CAPS_DOWN.store(false, Ordering::Relaxed);
-                }
+            CAPS_DEFAULT_ID | CAPS_SWITCH_ID => {
+                let enabled = wparam & 0xffff == CAPS_SWITCH_ID;
+                ENABLED.store(enabled, Ordering::Relaxed);
+                CAPS_DOWN.store(false, Ordering::Relaxed);
+                write_setting("CapsLockEnabled", enabled as u32);
+                0
+            }
+            FLAG_US_ID | FLAG_UK_ID => {
+                let setting = (wparam & 0xffff == FLAG_UK_ID) as u16;
+                ENGLISH_FLAG_SETTING.store(setting, Ordering::Relaxed);
+                write_setting("EnglishFlag", setting as u32);
+                CURRENT_LANGUAGE.store(0, Ordering::Relaxed);
+                set_flag(window, foreground_language());
                 0
             }
             HIDE_ID => {
@@ -379,6 +448,9 @@ fn main() {
             show_error("Не удалось перезапустить приложение с правами администратора.");
             return;
         }
+
+        ENABLED.store(read_setting("CapsLockEnabled", 1) != 0, Ordering::Relaxed);
+        ENGLISH_FLAG_SETTING.store(read_setting("EnglishFlag", 0) as u16, Ordering::Relaxed);
 
         let mutex_name = wide("Local\\CapsLockLayoutSingleInstance");
         let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
@@ -534,6 +606,55 @@ unsafe fn set_autostart(enabled: bool) -> bool {
     ))
 }
 
+unsafe fn read_setting(name: &str, default: u32) -> u32 {
+    let mut value = default;
+    let mut size = size_of::<u32>() as u32;
+    let status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        wide("Software\\CapsLockLayout").as_ptr(),
+        wide(name).as_ptr(),
+        RRF_RT_REG_DWORD,
+        null_mut(),
+        &mut value as *mut _ as *mut c_void,
+        &mut size,
+    );
+    if status == ERROR_SUCCESS {
+        value
+    } else {
+        default
+    }
+}
+
+unsafe fn write_setting(name: &str, value: u32) {
+    let mut key = null_mut();
+    if RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        wide("Software\\CapsLockLayout").as_ptr(),
+        0,
+        null(),
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        null(),
+        &mut key,
+        null_mut(),
+    ) == ERROR_SUCCESS
+    {
+        RegSetValueExW(
+            key,
+            wide(name).as_ptr(),
+            0,
+            REG_DWORD,
+            &value as *const _ as *const u8,
+            size_of::<u32>() as u32,
+        );
+        RegCloseKey(key);
+    }
+}
+
+fn is_uk_flag(setting: u32) -> bool {
+    setting == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +698,12 @@ mod tests {
     fn reflects_the_current_autostart_state_in_the_menu() {
         assert_eq!(autostart_label(false), "Добавить в автозагрузку");
         assert_eq!(autostart_label(true), "Убрать из автозагрузки");
+    }
+
+    #[test]
+    fn maps_only_the_uk_setting_to_the_uk_flag() {
+        assert!(!is_uk_flag(0));
+        assert!(is_uk_flag(1));
+        assert!(!is_uk_flag(2));
     }
 }
