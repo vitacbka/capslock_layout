@@ -10,8 +10,11 @@ use windows_sys::Win32::Foundation::{
     POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NO_WINDOW, CreateMutexW, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION,
+    STARTUPINFOW, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, GetKeyboardLayoutList, HKL, VK_CAPITAL,
 };
@@ -28,6 +31,7 @@ const SHOW_TRAY_MESSAGE: u32 = WM_APP + 2;
 const TOGGLE_ID: usize = 1001;
 const EXIT_ID: usize = 1002;
 const HIDE_ID: usize = 1003;
+const AUTOSTART_ID: usize = 1004;
 const MAX_LAYOUTS: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -131,7 +135,7 @@ unsafe fn fill_rect(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color
 }
 
 unsafe fn create_flag_icon(language: u16) -> HICON {
-    let width = GetSystemMetrics(SM_CXICON);
+    let width = flag_width(GetSystemMetrics(SM_CXICON));
     let height = GetSystemMetrics(SM_CYICON);
     let screen = GetDC(null_mut());
     let dc = CreateCompatibleDC(screen);
@@ -253,6 +257,12 @@ unsafe fn show_menu(window: HWND) {
         wide("Переключать раскладку").as_ptr(),
     );
     AppendMenuW(menu, MF_STRING, HIDE_ID, wide("Скрыть из трея").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        AUTOSTART_ID,
+        wide(autostart_label(autostart_enabled())).as_ptr(),
+    );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, EXIT_ID, wide("Выход").as_ptr());
 
@@ -302,6 +312,12 @@ unsafe extern "system" fn window_proc(
             }
             HIDE_ID => {
                 hide_tray(window);
+                0
+            }
+            AUTOSTART_ID => {
+                if !set_autostart(!autostart_enabled()) {
+                    show_error("Не удалось изменить настройку автозагрузки.");
+                }
                 0
             }
             EXIT_ID => {
@@ -404,6 +420,65 @@ fn main() {
     }
 }
 
+fn flag_width(base: i32) -> i32 {
+    base + base / 4
+}
+
+fn autostart_label(enabled: bool) -> &'static str {
+    if enabled {
+        "Убрать из автозагрузки"
+    } else {
+        "Добавить в автозагрузку"
+    }
+}
+
+unsafe fn run_schtasks(arguments: &str) -> bool {
+    let mut command = wide(&format!("C:\\Windows\\System32\\schtasks.exe {arguments}"));
+    let mut startup: STARTUPINFOW = zeroed();
+    startup.cb = size_of::<STARTUPINFOW>() as u32;
+    let mut process: PROCESS_INFORMATION = zeroed();
+    if CreateProcessW(
+        null(),
+        command.as_mut_ptr(),
+        null(),
+        null(),
+        0,
+        CREATE_NO_WINDOW,
+        null(),
+        null(),
+        &startup,
+        &mut process,
+    ) == 0
+    {
+        return false;
+    }
+    WaitForSingleObject(process.hProcess, 10_000);
+    let mut exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &mut exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    exit_code == 0
+}
+
+unsafe fn autostart_enabled() -> bool {
+    run_schtasks("/Query /TN CapsLockLayout")
+}
+
+unsafe fn set_autostart(enabled: bool) -> bool {
+    if !enabled {
+        return run_schtasks("/Delete /TN CapsLockLayout /F");
+    }
+    let mut path = [0u16; 260];
+    let length = GetModuleFileNameW(null_mut(), path.as_mut_ptr(), path.len() as u32);
+    if length == 0 || length as usize >= path.len() {
+        return false;
+    }
+    let path = String::from_utf16_lossy(&path[..length as usize]);
+    run_schtasks(&format!(
+        "/Create /TN CapsLockLayout /TR \"\\\"{path}\\\"\" /SC ONLOGON /RL HIGHEST /F"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +510,17 @@ mod tests {
         assert_eq!(flag_language(RUSSIAN), RUSSIAN);
         assert_eq!(flag_language(ENGLISH), ENGLISH);
         assert_eq!(flag_language(0x0407), ENGLISH);
+    }
+
+    #[test]
+    fn makes_flags_twenty_five_percent_wider() {
+        assert_eq!(flag_width(32), 40);
+        assert_eq!(flag_width(16), 20);
+    }
+
+    #[test]
+    fn reflects_the_current_autostart_state_in_the_menu() {
+        assert_eq!(autostart_label(false), "Добавить в автозагрузку");
+        assert_eq!(autostart_label(true), "Убрать из автозагрузки");
     }
 }
