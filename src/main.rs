@@ -28,6 +28,7 @@ const ENGLISH: u16 = 0x0409;
 const RUSSIAN: u16 = 0x0419;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const SHOW_TRAY_MESSAGE: u32 = WM_APP + 2;
+const SWITCH_LAYOUT_MESSAGE: u32 = WM_APP + 3;
 const TOGGLE_ID: usize = 1001;
 const EXIT_ID: usize = 1002;
 const HIDE_ID: usize = 1003;
@@ -98,7 +99,15 @@ unsafe fn switch_layout() {
         if let Some(handle) = handle {
             let owner = GetWindow(foreground, GW_OWNER);
             let destination = if owner.is_null() { foreground } else { owner };
-            PostMessageW(destination, WM_INPUTLANGCHANGEREQUEST, 0, handle as isize);
+            SendMessageTimeoutW(
+                destination,
+                WM_INPUTLANGCHANGEREQUEST,
+                0,
+                handle as isize,
+                SMTO_ABORTIFHUNG,
+                1000,
+                null_mut(),
+            );
             set_flag(WINDOW.load(Ordering::Relaxed), target);
         }
     }
@@ -113,7 +122,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, event: WPARAM, data: LPARAM) 
             if is_down || is_up {
                 let was_down = CAPS_DOWN.swap(is_down, Ordering::Relaxed);
                 if should_switch(is_down, was_down) {
-                    switch_layout();
+                    PostMessageW(WINDOW.load(Ordering::Relaxed), SWITCH_LAYOUT_MESSAGE, 0, 0);
                 }
                 return 1;
             }
@@ -290,6 +299,10 @@ unsafe extern "system" fn window_proc(
         }
         SHOW_TRAY_MESSAGE => {
             show_tray(window);
+            0
+        }
+        SWITCH_LAYOUT_MESSAGE => {
+            switch_layout();
             0
         }
         WM_TIMER => {
