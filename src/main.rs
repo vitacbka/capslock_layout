@@ -10,10 +10,14 @@ use windows_sys::Win32::Foundation::{
     POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TokenElevation,
+    TokenElevationType, TokenElevationTypeDefault, TokenElevationTypeFull,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateMutexW, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION,
-    STARTUPINFOW, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
+    OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, GetKeyboardLayoutList, HKL, VK_CAPITAL,
@@ -367,6 +371,15 @@ fn show_error(text: &str) {
 
 fn main() {
     unsafe {
+        if !is_elevated() {
+            let task_ready = autostart_enabled() || set_autostart(true);
+            if task_ready && run_schtasks("/Run /TN CapsLockLayout") {
+                return;
+            }
+            show_error("Не удалось перезапустить приложение с правами администратора.");
+            return;
+        }
+
         let mutex_name = wide("Local\\CapsLockLayoutSingleInstance");
         let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if mutex.is_null() {
@@ -443,6 +456,35 @@ fn autostart_label(enabled: bool) -> &'static str {
     } else {
         "Добавить в автозагрузку"
     }
+}
+
+unsafe fn is_elevated() -> bool {
+    let mut token = null_mut();
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        return false;
+    }
+    let mut elevation: TOKEN_ELEVATION = zeroed();
+    let mut returned = 0;
+    let success = GetTokenInformation(
+        token,
+        TokenElevation,
+        &mut elevation as *mut _ as *mut c_void,
+        size_of::<TOKEN_ELEVATION>() as u32,
+        &mut returned,
+    );
+    let mut elevation_type: TOKEN_ELEVATION_TYPE = 0;
+    let type_success = GetTokenInformation(
+        token,
+        TokenElevationType,
+        &mut elevation_type as *mut _ as *mut c_void,
+        size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+        &mut returned,
+    );
+    CloseHandle(token);
+    success != 0
+        && type_success != 0
+        && (elevation_type == TokenElevationTypeFull
+            || (elevation_type == TokenElevationTypeDefault && elevation.TokenIsElevated != 0))
 }
 
 unsafe fn run_schtasks(arguments: &str) -> bool {
