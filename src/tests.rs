@@ -47,3 +47,18 @@ fn maps_only_the_uk_setting_to_the_uk_flag() {
     assert!(is_uk_flag(1));
     assert!(!is_uk_flag(2));
 }
+
+#[test]
+fn reflects_the_floating_window_state_in_the_menu() {
+    assert_eq!(floating_label(false), "Активировать плавающее окно");
+    assert_eq!(floating_label(true), "Деактивировать плавающее окно");
+}
+
+#[test]
+fn scales_the_floating_window_without_changing_the_tray_icon() {
+    assert_eq!(floating_dimension(40, 75), 30);
+    assert_eq!(floating_dimension(40, 100), 40);
+    assert_eq!(floating_dimension(40, 150), 60);
+    assert_eq!(floating_dimension(40, 200), 80);
+    assert_eq!(floating_dimension(32, 200), 64);
+}

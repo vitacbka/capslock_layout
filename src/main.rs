@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU16, Ordering};
 use windows_sys::Win32::Foundation::{
     COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND,
     LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardLayoutList, HKL, VK_CAPITAL,
+    GetKeyboardLayout, GetKeyboardLayoutList, HKL, ReleaseCapture, SetCapture, VK_CAPITAL,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -44,6 +44,11 @@ const CAPS_DEFAULT_ID: usize = 1005;
 const CAPS_SWITCH_ID: usize = 1006;
 const FLAG_US_ID: usize = 1007;
 const FLAG_UK_ID: usize = 1008;
+const FLOATING_ID: usize = 1009;
+const FLOATING_SIZE_75_ID: usize = 1010;
+const FLOATING_SIZE_100_ID: usize = 1011;
+const FLOATING_SIZE_150_ID: usize = 1012;
+const FLOATING_SIZE_200_ID: usize = 1013;
 const MAX_LAYOUTS: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -53,6 +58,12 @@ static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static CURRENT_ICON: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static CURRENT_LANGUAGE: AtomicU16 = AtomicU16::new(0);
 static ENGLISH_FLAG_SETTING: AtomicU16 = AtomicU16::new(0);
+static FLOATING_VISIBLE: AtomicBool = AtomicBool::new(false);
+static FLOAT_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static FLOATING_SIZE_PERCENT: AtomicU16 = AtomicU16::new(100);
+static DRAGGING: AtomicBool = AtomicBool::new(false);
+static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
+static DRAG_OFFSET_Y: AtomicI32 = AtomicI32::new(0);
 
 fn next_language(current: u16, available: &[u16]) -> Option<u16> {
     let target = if current == RUSSIAN { ENGLISH } else { RUSSIAN };
@@ -263,6 +274,139 @@ unsafe fn set_flag(window: HWND, language: u16) {
         DestroyIcon(previous);
     }
     CURRENT_LANGUAGE.store(language, Ordering::Relaxed);
+    InvalidateRect(FLOAT_WINDOW.load(Ordering::Relaxed), null(), 1);
+}
+
+unsafe extern "system" fn floating_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_PAINT => {
+            let mut paint: PAINTSTRUCT = zeroed();
+            let dc = BeginPaint(window, &mut paint);
+            let percent = FLOATING_SIZE_PERCENT.load(Ordering::Relaxed);
+            DrawIconEx(
+                dc,
+                0,
+                0,
+                CURRENT_ICON.load(Ordering::Relaxed),
+                floating_dimension(flag_width(GetSystemMetrics(SM_CXICON)), percent),
+                floating_dimension(GetSystemMetrics(SM_CYICON), percent),
+                0,
+                null_mut(),
+                DI_NORMAL,
+            );
+            EndPaint(window, &paint);
+            0
+        }
+        WM_LBUTTONDOWN => {
+            DRAG_OFFSET_X.store(
+                (lparam as u32 & 0xffff) as u16 as i16 as i32,
+                Ordering::Relaxed,
+            );
+            DRAG_OFFSET_Y.store(
+                ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
+                Ordering::Relaxed,
+            );
+            DRAGGING.store(true, Ordering::Relaxed);
+            SetCapture(window);
+            0
+        }
+        WM_MOUSEMOVE if DRAGGING.load(Ordering::Relaxed) => {
+            let mut point: POINT = zeroed();
+            GetCursorPos(&mut point);
+            SetWindowPos(
+                window,
+                null_mut(),
+                point.x - DRAG_OFFSET_X.load(Ordering::Relaxed),
+                point.y - DRAG_OFFSET_Y.load(Ordering::Relaxed),
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            0
+        }
+        WM_LBUTTONUP if DRAGGING.load(Ordering::Relaxed) => {
+            DRAGGING.store(false, Ordering::Relaxed);
+            ReleaseCapture();
+            let mut rect: RECT = zeroed();
+            GetWindowRect(window, &mut rect);
+            write_setting("FloatingX", rect.left as u32);
+            write_setting("FloatingY", rect.top as u32);
+            0
+        }
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+unsafe fn set_floating_size(percent: u16) {
+    if !matches!(percent, 75 | 100 | 150 | 200) {
+        return;
+    }
+    FLOATING_SIZE_PERCENT.store(percent, Ordering::Relaxed);
+    write_setting("FloatingSize", percent as u32);
+    let window = FLOAT_WINDOW.load(Ordering::Relaxed);
+    if !window.is_null() {
+        SetWindowPos(
+            window,
+            null_mut(),
+            0,
+            0,
+            floating_dimension(flag_width(GetSystemMetrics(SM_CXICON)), percent),
+            floating_dimension(GetSystemMetrics(SM_CYICON), percent),
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        InvalidateRect(window, null(), 1);
+    }
+}
+
+unsafe fn set_floating(visible: bool) {
+    let mut window = FLOAT_WINDOW.load(Ordering::Relaxed);
+    if visible && window.is_null() {
+        let percent = FLOATING_SIZE_PERCENT.load(Ordering::Relaxed);
+        let width = floating_dimension(flag_width(GetSystemMetrics(SM_CXICON)), percent);
+        let height = floating_dimension(GetSystemMetrics(SM_CYICON), percent);
+        let mut work_area: RECT = zeroed();
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            &mut work_area as *mut _ as *mut c_void,
+            0,
+        );
+        let saved_x = read_setting("FloatingX", i32::MIN as u32) as i32;
+        let saved_y = read_setting("FloatingY", i32::MIN as u32) as i32;
+        let (x, y) = if saved_x == i32::MIN || saved_y == i32::MIN {
+            (work_area.right - width - 16, work_area.bottom - height - 16)
+        } else {
+            (saved_x, saved_y)
+        };
+        window = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            wide("CapsLockLayoutFloatingWindow").as_ptr(),
+            wide("CapsLock Layout").as_ptr(),
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        FLOAT_WINDOW.store(window, Ordering::Relaxed);
+    }
+    if !window.is_null() {
+        ShowWindow(window, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        if visible {
+            InvalidateRect(window, null(), 1);
+        }
+    }
+    FLOATING_VISIBLE.store(visible, Ordering::Relaxed);
+    write_setting("FloatingWindow", visible as u32);
 }
 
 unsafe fn show_tray(window: HWND) {
@@ -286,7 +430,8 @@ unsafe fn show_menu(window: HWND) {
     let menu = CreatePopupMenu();
     let behavior_menu = CreatePopupMenu();
     let flag_menu = CreatePopupMenu();
-    if menu.is_null() || behavior_menu.is_null() || flag_menu.is_null() {
+    let size_menu = CreatePopupMenu();
+    if menu.is_null() || behavior_menu.is_null() || flag_menu.is_null() || size_menu.is_null() {
         return;
     }
 
@@ -330,6 +475,32 @@ unsafe fn show_menu(window: HWND) {
         wide("Флаг английской раскладки").as_ptr(),
     );
 
+    let size = FLOATING_SIZE_PERCENT.load(Ordering::Relaxed);
+    for (id, percent, label) in [
+        (FLOATING_SIZE_75_ID, 75, "75%"),
+        (FLOATING_SIZE_100_ID, 100, "100%"),
+        (FLOATING_SIZE_150_ID, 150, "150%"),
+        (FLOATING_SIZE_200_ID, 200, "200%"),
+    ] {
+        AppendMenuW(
+            size_menu,
+            MF_STRING | if size == percent { MF_CHECKED } else { 0 },
+            id,
+            wide(label).as_ptr(),
+        );
+    }
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        size_menu as usize,
+        wide("Размер плавающего окна").as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        FLOATING_ID,
+        wide(floating_label(FLOATING_VISIBLE.load(Ordering::Relaxed))).as_ptr(),
+    );
     AppendMenuW(menu, MF_STRING, HIDE_ID, wide("Скрыть из трея").as_ptr());
     AppendMenuW(
         menu,
@@ -396,6 +567,21 @@ unsafe extern "system" fn window_proc(
                 set_flag(window, foreground_language());
                 0
             }
+            FLOATING_SIZE_75_ID | FLOATING_SIZE_100_ID | FLOATING_SIZE_150_ID
+            | FLOATING_SIZE_200_ID => {
+                let percent = match wparam & 0xffff {
+                    FLOATING_SIZE_75_ID => 75,
+                    FLOATING_SIZE_100_ID => 100,
+                    FLOATING_SIZE_150_ID => 150,
+                    _ => 200,
+                };
+                set_floating_size(percent);
+                0
+            }
+            FLOATING_ID => {
+                set_floating(!FLOATING_VISIBLE.load(Ordering::Relaxed));
+                0
+            }
             HIDE_ID => {
                 hide_tray(window);
                 0
@@ -414,6 +600,7 @@ unsafe extern "system" fn window_proc(
         },
         WM_DESTROY => {
             hide_tray(window);
+            DestroyWindow(FLOAT_WINDOW.load(Ordering::Relaxed));
             KillTimer(window, 1);
             WINDOW.store(null_mut(), Ordering::Relaxed);
             let icon = CURRENT_ICON.swap(null_mut(), Ordering::Relaxed);
@@ -451,6 +638,15 @@ fn main() {
 
         ENABLED.store(read_setting("CapsLockEnabled", 1) != 0, Ordering::Relaxed);
         ENGLISH_FLAG_SETTING.store(read_setting("EnglishFlag", 0) as u16, Ordering::Relaxed);
+        let floating_size = read_setting("FloatingSize", 100) as u16;
+        FLOATING_SIZE_PERCENT.store(
+            if matches!(floating_size, 75 | 100 | 150 | 200) {
+                floating_size
+            } else {
+                100
+            },
+            Ordering::Relaxed,
+        );
 
         let mutex_name = wide("Local\\CapsLockLayoutSingleInstance");
         let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
@@ -477,6 +673,18 @@ fn main() {
             CloseHandle(mutex);
             return;
         }
+        let floating_class_name = wide("CapsLockLayoutFloatingWindow");
+        let floating_class = WNDCLASSW {
+            lpfnWndProc: Some(floating_proc),
+            hInstance: instance,
+            lpszClassName: floating_class_name.as_ptr(),
+            ..zeroed()
+        };
+        if RegisterClassW(&floating_class) == 0 {
+            show_error("Не удалось зарегистрировать плавающее окно.");
+            CloseHandle(mutex);
+            return;
+        }
 
         let window = CreateWindowExW(
             0,
@@ -498,6 +706,9 @@ fn main() {
             return;
         }
         WINDOW.store(window, Ordering::Relaxed);
+        if read_setting("FloatingWindow", 0) != 0 {
+            set_floating(true);
+        }
 
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0);
         if hook.is_null() {
@@ -653,6 +864,18 @@ unsafe fn write_setting(name: &str, value: u32) {
 
 fn is_uk_flag(setting: u32) -> bool {
     setting == 1
+}
+
+fn floating_label(visible: bool) -> &'static str {
+    if visible {
+        "Деактивировать плавающее окно"
+    } else {
+        "Активировать плавающее окно"
+    }
+}
+
+fn floating_dimension(base: i32, percent: u16) -> i32 {
+    base * percent as i32 / 100
 }
 
 #[cfg(test)]
