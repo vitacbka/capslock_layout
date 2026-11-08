@@ -424,6 +424,37 @@ unsafe fn set_floating(visible: bool) {
     write_setting("FloatingWindow", visible as u32);
 }
 
+unsafe fn refresh_floating() {
+    if !FLOATING_VISIBLE.load(Ordering::Relaxed) {
+        return;
+    }
+    let window = FLOAT_WINDOW.load(Ordering::Relaxed);
+    if window.is_null() {
+        return;
+    }
+    let mut rect: RECT = zeroed();
+    GetWindowRect(window, &mut rect);
+    let center = POINT {
+        x: rect.left + (rect.right - rect.left) / 2,
+        y: rect.top + (rect.bottom - rect.top) / 2,
+    };
+    if MonitorFromPoint(center, MONITOR_DEFAULTTONULL).is_null() {
+        reset_floating();
+        return;
+    }
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    SetWindowPos(
+        window,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    InvalidateRect(window, null(), 1);
+}
+
 unsafe fn reset_floating() {
     set_floating_size(100);
     set_floating(true);
@@ -590,6 +621,7 @@ unsafe extern "system" fn window_proc(
             if TRAY_VISIBLE.load(Ordering::Relaxed) {
                 set_flag(window, foreground_language());
             }
+            refresh_floating();
             0
         }
         TRAY_MESSAGE if lparam == WM_RBUTTONUP as isize => {
