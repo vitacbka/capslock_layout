@@ -26,7 +26,7 @@
 
 Rust и установка не нужны — приложение распространяется одним готовым EXE-файлом.
 
-1. Скачайте [`capslock-layout.exe`](https://github.com/vitacbka/caps_lock_layout/releases/download/v0.1.0/capslock-layout.exe) из [релиза v0.1.0](https://github.com/vitacbka/caps_lock_layout/releases/tag/v0.1.0).
+1. Скачайте [`capslock-layout.exe`](https://github.com/vitacbka/capslock_layout/releases/download/v0.1.0/capslock-layout.exe) из [релиза v0.1.0](https://github.com/vitacbka/capslock_layout/releases/tag/v0.1.0).
 2. Сохраните файл в постоянную папку, из которой будете запускать приложение.
 3. Запустите EXE двойным кликом. Если Windows покажет запрос UAC, подтвердите его.
 4. Главного окна нет: в области уведомлений появится флаг текущей раскладки. Если его не видно, откройте скрытые значки в системном трее.
