@@ -49,6 +49,7 @@ const FLOATING_SIZE_75_ID: usize = 1010;
 const FLOATING_SIZE_100_ID: usize = 1011;
 const FLOATING_SIZE_150_ID: usize = 1012;
 const FLOATING_SIZE_200_ID: usize = 1013;
+const FLOATING_RESET_ID: usize = 1014;
 const MAX_LAYOUTS: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -363,25 +364,39 @@ unsafe fn set_floating_size(percent: u16) {
     }
 }
 
+unsafe fn default_floating_position(width: i32, height: i32) -> (i32, i32) {
+    let mut work_area: RECT = zeroed();
+    SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        &mut work_area as *mut _ as *mut c_void,
+        0,
+    );
+    (work_area.right - width - 16, work_area.bottom - height - 16)
+}
+
 unsafe fn set_floating(visible: bool) {
     let mut window = FLOAT_WINDOW.load(Ordering::Relaxed);
     if visible && window.is_null() {
         let percent = FLOATING_SIZE_PERCENT.load(Ordering::Relaxed);
         let width = floating_dimension(flag_width(GetSystemMetrics(SM_CXICON)), percent);
         let height = floating_dimension(GetSystemMetrics(SM_CYICON), percent);
-        let mut work_area: RECT = zeroed();
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            &mut work_area as *mut _ as *mut c_void,
-            0,
-        );
         let saved_x = read_setting("FloatingX", i32::MIN as u32) as i32;
         let saved_y = read_setting("FloatingY", i32::MIN as u32) as i32;
-        let (x, y) = if saved_x == i32::MIN || saved_y == i32::MIN {
-            (work_area.right - width - 16, work_area.bottom - height - 16)
-        } else {
+        let on_monitor = saved_x != i32::MIN
+            && saved_y != i32::MIN
+            && !MonitorFromPoint(
+                POINT {
+                    x: saved_x,
+                    y: saved_y,
+                },
+                MONITOR_DEFAULTTONULL,
+            )
+            .is_null();
+        let (x, y) = if on_monitor {
             (saved_x, saved_y)
+        } else {
+            default_floating_position(width, height)
         };
         window = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -407,6 +422,30 @@ unsafe fn set_floating(visible: bool) {
     }
     FLOATING_VISIBLE.store(visible, Ordering::Relaxed);
     write_setting("FloatingWindow", visible as u32);
+}
+
+unsafe fn reset_floating() {
+    set_floating_size(100);
+    set_floating(true);
+    let window = FLOAT_WINDOW.load(Ordering::Relaxed);
+    if !window.is_null() {
+        let (x, y) = default_floating_position(
+            flag_width(GetSystemMetrics(SM_CXICON)),
+            GetSystemMetrics(SM_CYICON),
+        );
+        SetWindowPos(
+            window,
+            null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        write_setting("FloatingX", x as u32);
+        write_setting("FloatingY", y as u32);
+        InvalidateRect(window, null(), 1);
+    }
 }
 
 unsafe fn show_tray(window: HWND) {
@@ -501,6 +540,12 @@ unsafe fn show_menu(window: HWND) {
         FLOATING_ID,
         wide(floating_label(FLOATING_VISIBLE.load(Ordering::Relaxed))).as_ptr(),
     );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        FLOATING_RESET_ID,
+        wide("Сбросить плавающее окно").as_ptr(),
+    );
     AppendMenuW(menu, MF_STRING, HIDE_ID, wide("Скрыть из трея").as_ptr());
     AppendMenuW(
         menu,
@@ -580,6 +625,10 @@ unsafe extern "system" fn window_proc(
             }
             FLOATING_ID => {
                 set_floating(!FLOATING_VISIBLE.load(Ordering::Relaxed));
+                0
+            }
+            FLOATING_RESET_ID => {
+                reset_floating();
                 0
             }
             HIDE_ID => {
