@@ -42,6 +42,25 @@ fn reflects_the_current_autostart_state_in_the_menu() {
 }
 
 #[test]
+fn escapes_xml_special_characters_in_task_paths() {
+    assert_eq!(
+        xml_escape("C:\\A&B\\<app>.exe"),
+        "C:\\A&amp;B\\&lt;app&gt;.exe"
+    );
+}
+
+#[test]
+fn registers_the_task_without_power_restrictions() {
+    let xml = task_xml("C:\\Apps\\capslock-layout.exe", "vitac");
+    assert!(xml.contains("<Command>\"C:\\Apps\\capslock-layout.exe\"</Command>"));
+    assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+    assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+    assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+    assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+    assert!(xml.contains("<UserId>vitac</UserId>"));
+}
+
+#[test]
 fn maps_only_the_uk_setting_to_the_uk_flag() {
     assert!(!is_uk_flag(0));
     assert!(is_uk_flag(1));

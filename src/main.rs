@@ -668,7 +668,10 @@ unsafe extern "system" fn window_proc(
                 0
             }
             AUTOSTART_ID => {
-                if !set_autostart(!autostart_enabled()) {
+                let enabled = !autostart_enabled();
+                if set_autostart(enabled) {
+                    write_setting("AutostartEnabled", enabled as u32);
+                } else {
                     show_error("Не удалось изменить настройку автозагрузки.");
                 }
                 0
@@ -709,8 +712,7 @@ fn show_error(text: &str) {
 fn main() {
     unsafe {
         if !is_elevated() {
-            let task_ready = autostart_enabled() || set_autostart(true);
-            if task_ready && run_schtasks("/Run /TN CapsLockLayout") {
+            if autostart_enabled() && run_schtasks("/Run /TN CapsLockLayout") {
                 return;
             }
             show_error("Не удалось перезапустить приложение с правами администратора.");
@@ -740,6 +742,8 @@ fn main() {
             CloseHandle(mutex);
             return;
         }
+
+        sync_autostart();
 
         let instance: HINSTANCE = GetModuleHandleW(null());
         let class_name = wide("CapsLockLayoutWindow");
@@ -884,18 +888,119 @@ unsafe fn autostart_enabled() -> bool {
 }
 
 unsafe fn set_autostart(enabled: bool) -> bool {
-    if !enabled {
-        return run_schtasks("/Delete /TN CapsLockLayout /F");
+    if enabled {
+        register_autostart()
+    } else {
+        run_schtasks("/Delete /TN CapsLockLayout /F")
     }
-    let mut path = [0u16; 260];
-    let length = GetModuleFileNameW(null_mut(), path.as_mut_ptr(), path.len() as u32);
-    if length == 0 || length as usize >= path.len() {
+}
+
+/// Applies the saved autostart preference on every start. The task is
+/// re-registered each time so a moved or rebuilt executable keeps working and
+/// stale task settings (for example "start only on AC power") are repaired.
+unsafe fn sync_autostart() {
+    if read_setting("AutostartEnabled", 1) != 0 {
+        register_autostart();
+    } else if autostart_enabled() {
+        run_schtasks("/Delete /TN CapsLockLayout /F");
+    }
+}
+
+unsafe fn register_autostart() -> bool {
+    let Some(path) = current_exe_path() else {
+        return false;
+    };
+    let Ok(user) = std::env::var("USERNAME") else {
+        return false;
+    };
+    if user.is_empty() {
         return false;
     }
-    let path = String::from_utf16_lossy(&path[..length as usize]);
-    run_schtasks(&format!(
-        "/Create /TN CapsLockLayout /TR \"\\\"{path}\\\"\" /SC ONLOGON /RL HIGHEST /F"
-    ))
+
+    let xml = task_xml(&path, &user);
+    let file = std::env::temp_dir().join("capslock-layout-task.xml");
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    if std::fs::write(&file, bytes).is_err() {
+        return false;
+    }
+    let created = run_schtasks(&format!(
+        "/Create /TN CapsLockLayout /XML \"{}\" /F",
+        file.display()
+    ));
+    let _ = std::fs::remove_file(&file);
+    created
+}
+
+unsafe fn current_exe_path() -> Option<String> {
+    let mut path = [0u16; 32768];
+    let length = GetModuleFileNameW(null_mut(), path.as_mut_ptr(), path.len() as u32);
+    if length == 0 || length as usize >= path.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&path[..length as usize]))
+}
+
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn task_xml(path: &str, user: &str) -> String {
+    let command = xml_escape(&format!("\"{path}\""));
+    let user = xml_escape(user);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+  <RegistrationInfo>\n\
+    <Description>CapsLock Layout</Description>\n\
+  </RegistrationInfo>\n\
+  <Triggers>\n\
+    <LogonTrigger>\n\
+      <Enabled>true</Enabled>\n\
+      <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n\
+      <UserId>{user}</UserId>\n\
+    </LogonTrigger>\n\
+  </Triggers>\n\
+  <Principals>\n\
+    <Principal id=\"Author\">\n\
+      <UserId>{user}</UserId>\n\
+      <LogonType>InteractiveToken</LogonType>\n\
+      <RunLevel>HighestAvailable</RunLevel>\n\
+    </Principal>\n\
+  </Principals>\n\
+  <Settings>\n\
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+    <AllowHardTerminate>true</AllowHardTerminate>\n\
+    <StartWhenAvailable>true</StartWhenAvailable>\n\
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n\
+    <AllowStartOnDemand>true</AllowStartOnDemand>\n\
+    <Enabled>true</Enabled>\n\
+    <Hidden>false</Hidden>\n\
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n\
+    <WakeToRun>false</WakeToRun>\n\
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+    <Priority>7</Priority>\n\
+  </Settings>\n\
+  <Actions Context=\"Author\">\n\
+    <Exec>\n\
+      <Command>{command}</Command>\n\
+    </Exec>\n\
+  </Actions>\n\
+</Task>\n"
+    )
 }
 
 unsafe fn read_setting(name: &str, default: u32) -> u32 {
