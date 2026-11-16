@@ -61,6 +61,12 @@ fn registers_the_task_without_power_restrictions() {
 }
 
 #[test]
+fn delays_logon_start_until_the_desktop_is_ready() {
+    let xml = task_xml("C:\\Apps\\capslock-layout.exe", "vitac");
+    assert!(xml.contains("<Delay>PT30S</Delay>"));
+}
+
+#[test]
 fn maps_only_the_uk_setting_to_the_uk_flag() {
     assert!(!is_uk_flag(0));
     assert!(is_uk_flag(1));

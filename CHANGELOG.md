@@ -2,6 +2,12 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по [SemVer](https://semver.org/lang/ru/).
 
+## [0.1.3] — 2026-11-16
+
+### Исправлено
+
+- Автозапуск откладывается на 30 секунд после входа в Windows, чтобы приложение не завершалось во время инициализации рабочего стола.
+
 ## [0.1.2] — 2026-11-10
 
 ### Исправлено
@@ -24,6 +30,7 @@
 
 Первый публичный выпуск: переключение раскладки RU ↔ EN по Caps Lock, флаг раскладки в трее, плавающее окно с флагом, настройки поведения Caps Lock, языка флага и размера плавающего окна.
 
+[0.1.3]: https://github.com/vitacbka/capslock_layout/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vitacbka/capslock_layout/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vitacbka/capslock_layout/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vitacbka/capslock_layout/releases/tag/v0.1.0

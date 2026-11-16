@@ -969,6 +969,7 @@ fn task_xml(path: &str, user: &str) -> String {
     <LogonTrigger>\n\
       <Enabled>true</Enabled>\n\
       <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n\
+      <Delay>PT30S</Delay>\n\
       <UserId>{user}</UserId>\n\
     </LogonTrigger>\n\
   </Triggers>\n\
