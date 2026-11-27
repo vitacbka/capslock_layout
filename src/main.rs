@@ -10,8 +10,8 @@ use std::sync::atomic::{
 };
 
 use windows_sys::Win32::Foundation::{
-    BOOL, COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FreeLibrary, GetLastError,
-    HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    BOOL, COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND,
+    LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -82,6 +82,9 @@ const OSD_SWITCHED_MESSAGE: u32 = WM_APP + 5;
 // Windows re-sends the same layout change; anything within this window is the
 // same switch, not a second one.
 const OSD_DUPLICATE_MS: u32 = 120;
+// How often (in poll ticks) the floating flag window is re-raised. The tick is
+// 250 ms, so every fourth tick is once a second - plenty for a topmost window.
+const POLL_TICKS_PER_REFRESH: u32 = 4;
 // How long Windows may take to apply a layout change request.
 const OSD_SWITCH_TIMEOUT_MS: u32 = 1000;
 const OSD_PREVIEW_HOTKEY_ID: i32 = 1;
@@ -107,6 +110,7 @@ const OSD_MODE_BOTH: u16 = 2;
 const OSD_DURATION_FAST: u16 = 0;
 const OSD_DURATION_NORMAL: u16 = 1;
 const OSD_DURATION_SLOW: u16 = 2;
+const OSD_DURATION_VERY_SLOW: u16 = 3;
 const MAX_OSD_WINDOWS: usize = 16;
 const OSD_RADIUS: i32 = 16;
 const OSD_FILL_ALPHA: u8 = 222;
@@ -181,6 +185,9 @@ static PENDING_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 // The foreground layout the poller last observed, so an external switch is
 // detected even while the OSD is hidden (OSD_LANGUAGE is reset on hide).
 static LAST_SEEN_LANGUAGE: AtomicU16 = AtomicU16::new(0);
+// Poll ticks since start, used to throttle the more expensive floating-window
+// refresh so it does not run on every (fast) tick.
+static POLL_TICKS: AtomicU32 = AtomicU32::new(0);
 
 fn next_language(current: u16, available: &[u16]) -> Option<u16> {
     let target = if current == RUSSIAN { ENGLISH } else { RUSSIAN };
@@ -191,7 +198,12 @@ fn next_language(current: u16, available: &[u16]) -> Option<u16> {
 /// foreground window may still report the old layout; in that case base the
 /// next switch on the pending target. Returns the effective current language
 /// and whether the pending value was used.
-fn switch_start_language(now: u32, foreground: u16, pending: u16, pending_until: u32) -> (u16, bool) {
+fn switch_start_language(
+    now: u32,
+    foreground: u16,
+    pending: u16,
+    pending_until: u32,
+) -> (u16, bool) {
     if pending != 0 && reference_is_in_future(now, pending_until) && pending_until != now {
         (pending, true)
     } else {
@@ -372,15 +384,18 @@ fn osd_width_for(mode: u16, size_percent: u16) -> i32 {
 /// How long the OSD stays on screen before it fades out.
 fn osd_display_ms(duration: u16) -> u32 {
     match duration {
-        OSD_DURATION_FAST => 800,
-        OSD_DURATION_SLOW => 3000,
-        _ => 1500,
+        OSD_DURATION_FAST => 1500,
+        OSD_DURATION_SLOW => 6000,
+        OSD_DURATION_VERY_SLOW => 12000,
+        _ => 3000,
     }
 }
 
 fn valid_osd_duration(value: u16) -> u16 {
     match value {
-        OSD_DURATION_FAST | OSD_DURATION_NORMAL | OSD_DURATION_SLOW => value,
+        OSD_DURATION_FAST | OSD_DURATION_NORMAL | OSD_DURATION_SLOW | OSD_DURATION_VERY_SLOW => {
+            value
+        }
         _ => OSD_DURATION_NORMAL,
     }
 }
@@ -397,11 +412,12 @@ fn osd_size_options() -> [(&'static str, u16); 4] {
     [("75%", 75), ("100%", 100), ("125%", 125), ("150%", 150)]
 }
 
-fn osd_duration_options() -> [(&'static str, u16); 3] {
+fn osd_duration_options() -> [(&'static str, u16); 4] {
     [
         ("Быстрое исчезновение", OSD_DURATION_FAST),
         ("Обычное исчезновение", OSD_DURATION_NORMAL),
         ("Медленное исчезновение", OSD_DURATION_SLOW),
+        ("Очень медленное исчезновение", OSD_DURATION_VERY_SLOW),
     ]
 }
 
@@ -1083,24 +1099,41 @@ fn osd_position(corner: u16, work: RECT, width: i32, height: i32) -> (i32, i32) 
     }
 }
 
+/// Cached `GetDpiForMonitor` from shcore.dll. Resolved once: loading and
+/// freeing the DLL on every OSD show was needless churn and slowed the app
+/// down the more the OSD was used.
+static GET_DPI_FOR_MONITOR: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static DPI_PROCEDURE_RESOLVED: AtomicBool = AtomicBool::new(false);
+
 /// Monitor DPI via shcore.dll. Windows 10 1703+ ships it; when the lookup is
 /// unavailable the OSD keeps its base size and position.
 unsafe fn monitor_dpi(monitor: HMONITOR) -> u32 {
     type GetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> i32;
-    let mut dpi = 96u32;
-    let module = LoadLibraryW(wide("shcore.dll").as_ptr());
-    if !module.is_null() {
-        let address = GetProcAddress(module, c"GetDpiForMonitor".as_ptr() as *const u8);
-        if let Some(procedure) = address {
-            let get_dpi: GetDpiForMonitor = transmute(procedure);
-            let (mut x, mut y) = (96u32, 96u32);
-            if get_dpi(monitor, 0, &mut x, &mut y) == 0 {
-                dpi = x.max(96);
-            }
-        }
-        FreeLibrary(module);
+    if !DPI_PROCEDURE_RESOLVED.load(Ordering::Relaxed) {
+        let module = LoadLibraryW(wide("shcore.dll").as_ptr());
+        let address = if module.is_null() {
+            null_mut()
+        } else {
+            // Intentionally not freed: the module stays loaded for the process
+            // lifetime so the resolved pointer stays valid.
+            GetProcAddress(module, c"GetDpiForMonitor".as_ptr() as *const u8)
+                .map(|procedure| procedure as *mut c_void)
+                .unwrap_or(null_mut())
+        };
+        GET_DPI_FOR_MONITOR.store(address, Ordering::Relaxed);
+        DPI_PROCEDURE_RESOLVED.store(true, Ordering::Relaxed);
     }
-    dpi
+    let address = GET_DPI_FOR_MONITOR.load(Ordering::Relaxed);
+    if address.is_null() {
+        return 96;
+    }
+    let get_dpi: GetDpiForMonitor = transmute(address);
+    let (mut x, mut y) = (96u32, 96u32);
+    if get_dpi(monitor, 0, &mut x, &mut y) == 0 {
+        x.max(96)
+    } else {
+        96
+    }
 }
 
 /// A rounded-rectangle window region. The OSD frames are drawn with per-pixel
@@ -2039,7 +2072,9 @@ unsafe extern "system" fn osd_proc(
             }
             0
         }
-        WM_MOUSEMOVE if index.is_some_and(|i| OSD_DRAGGING[i].load(Ordering::Relaxed)) => {
+        WM_MOUSEMOVE if OSD_CUSTOM_ENABLED.load(Ordering::Relaxed)
+            && index.is_some_and(|i| OSD_DRAGGING[i].load(Ordering::Relaxed)) =>
+        {
             let index = index.unwrap();
             let mut point: POINT = zeroed();
             GetCursorPos(&mut point);
@@ -2052,6 +2087,14 @@ unsafe extern "system" fn osd_proc(
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            0
+        }
+        WM_MOUSEMOVE if index.is_some_and(|i| OSD_DRAGGING[i].load(Ordering::Relaxed)) => {
+            // Drag mode was turned off mid-drag: end the drag and keep the
+            // window where it is instead of moving it on bare mouse motion.
+            let index = index.unwrap();
+            OSD_DRAGGING[index].store(false, Ordering::Relaxed);
+            ReleaseCapture();
             0
         }
         WM_LBUTTONUP if index.is_some_and(|i| OSD_DRAGGING[i].load(Ordering::Relaxed)) => {
@@ -2274,7 +2317,12 @@ unsafe fn build_menu() -> HMENU {
     );
     AppendMenuW(
         osd_menu,
-        MF_STRING | if OSD_CUSTOM_ENABLED.load(Ordering::Relaxed) { MF_CHECKED } else { 0 },
+        MF_STRING
+            | if OSD_CUSTOM_ENABLED.load(Ordering::Relaxed) {
+                MF_CHECKED
+            } else {
+                0
+            },
         OSD_CUSTOM_POS_ID,
         wide("Перетаскивание (своя позиция)").as_ptr(),
     );
@@ -2287,7 +2335,12 @@ unsafe fn build_menu() -> HMENU {
 
     AppendMenuW(
         menu,
-        MF_STRING | if OSD_ANY_SWITCH.load(Ordering::Relaxed) { MF_CHECKED } else { 0 },
+        MF_STRING
+            | if OSD_ANY_SWITCH.load(Ordering::Relaxed) {
+                MF_CHECKED
+            } else {
+                0
+            },
         OSD_ANY_SWITCH_ID,
         wide("OSD при любом переключении").as_ptr(),
     );
@@ -2441,7 +2494,16 @@ unsafe extern "system" fn window_proc(
                 OSD_LAST_MESSAGE_MS.store(now, Ordering::Relaxed);
                 show_osd(current);
             }
-            refresh_floating();
+            // Keep the floating flag on top only occasionally. Doing it on every
+            // tick (4 times a second) kept calling SetWindowPos/InvalidateRect
+            // and made the app lag more and more over time. Once a second is
+            // enough - a topmost window rarely loses its z-order.
+            if POLL_TICKS.fetch_add(1, Ordering::Relaxed).is_multiple_of(POLL_TICKS_PER_REFRESH) {
+                refresh_floating();
+                // The tray icon also does not need a full rebuild unless the
+                // language actually changed; set_flag already deduplicates, but
+                // only call it here so the fast loop below stays cheap.
+            }
             0
         }
         WM_INPUTLANGCHANGE => {
@@ -2619,7 +2681,12 @@ unsafe fn handle_command(window: HWND, command: usize) {
             OSD_CUSTOM_ENABLED.store(enabled, Ordering::Relaxed);
             write_setting("OsdCustomEnabled", enabled as u32);
             if !enabled {
-                // Leaving drag mode forgets the manual spot: back to the corner.
+                // Leaving drag mode: forget the manual spot and make sure no
+                // window is left in a half-dragged state.
+                for dragging in &OSD_DRAGGING {
+                    dragging.store(false, Ordering::Relaxed);
+                }
+                ReleaseCapture();
                 reset_osd_custom_position();
             }
             preview_osd();
@@ -3062,7 +3129,10 @@ unsafe fn save_osd_custom_positions() {
     if x != i32::MIN && y != i32::MIN {
         write_setting("OsdCustomX", x as u32);
         write_setting("OsdCustomY", y as u32);
-        write_setting("OsdCustomEnabled", OSD_CUSTOM_ENABLED.load(Ordering::Relaxed) as u32);
+        write_setting(
+            "OsdCustomEnabled",
+            OSD_CUSTOM_ENABLED.load(Ordering::Relaxed) as u32,
+        );
     }
 }
 
@@ -3105,7 +3175,8 @@ fn custom_position(
     if !enabled || x == i32::MIN || y == i32::MIN {
         return None;
     }
-    let visible = x + width > work.left && x < work.right && y + height > work.top && y < work.bottom;
+    let visible =
+        x + width > work.left && x < work.right && y + height > work.top && y < work.bottom;
     visible.then_some((x, y))
 }
 

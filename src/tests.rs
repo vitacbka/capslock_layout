@@ -417,3 +417,17 @@ fn draws_different_pixels_for_russian_and_english() {
     paint_content(&mut english, width, height, ENGLISH, OSD_MODE_FLAGS, false);
     assert_ne!(russian, english, "the flag must change between RU and EN");
 }
+
+#[test]
+fn offers_longer_fade_options() {
+    // The default must be long enough to read comfortably, and every option
+    // must grow with its index (fast < normal < slow < very slow).
+    assert!(osd_display_ms(OSD_DURATION_NORMAL) >= 3_000);
+    assert!(osd_display_ms(OSD_DURATION_FAST) < osd_display_ms(OSD_DURATION_NORMAL));
+    assert!(osd_display_ms(OSD_DURATION_NORMAL) < osd_display_ms(OSD_DURATION_SLOW));
+    assert!(osd_display_ms(OSD_DURATION_SLOW) < osd_display_ms(OSD_DURATION_VERY_SLOW));
+    assert_eq!(osd_duration_options().len(), 4);
+    for (_, value) in osd_duration_options() {
+        assert_eq!(osd_duration_from_id(osd_duration_id(value)), Some(value));
+    }
+}
