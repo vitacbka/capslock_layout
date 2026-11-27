@@ -419,13 +419,14 @@ fn draws_different_pixels_for_russian_and_english() {
 }
 
 #[test]
-fn offers_longer_fade_options() {
-    // The default must be long enough to read comfortably, and every option
-    // must grow with its index (fast < normal < slow < very slow).
-    assert!(osd_display_ms(OSD_DURATION_NORMAL) >= 3_000);
+fn offers_fade_options_from_very_fast_to_slow() {
+    // The options grow with their index and never hold a long, distracting
+    // panel on screen (no "very slow" option any more).
+    assert!(osd_display_ms(OSD_DURATION_VERY_FAST) < osd_display_ms(OSD_DURATION_FAST));
     assert!(osd_display_ms(OSD_DURATION_FAST) < osd_display_ms(OSD_DURATION_NORMAL));
     assert!(osd_display_ms(OSD_DURATION_NORMAL) < osd_display_ms(OSD_DURATION_SLOW));
-    assert!(osd_display_ms(OSD_DURATION_SLOW) < osd_display_ms(OSD_DURATION_VERY_SLOW));
+    assert!(osd_display_ms(OSD_DURATION_VERY_FAST) > 0);
+    assert!(osd_display_ms(OSD_DURATION_SLOW) <= 5_000);
     assert_eq!(osd_duration_options().len(), 4);
     for (_, value) in osd_duration_options() {
         assert_eq!(osd_duration_from_id(osd_duration_id(value)), Some(value));

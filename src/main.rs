@@ -83,8 +83,9 @@ const OSD_SWITCHED_MESSAGE: u32 = WM_APP + 5;
 // same switch, not a second one.
 const OSD_DUPLICATE_MS: u32 = 120;
 // How often (in poll ticks) the floating flag window is re-raised. The tick is
-// 250 ms, so every fourth tick is once a second - plenty for a topmost window.
-const POLL_TICKS_PER_REFRESH: u32 = 4;
+// 250 ms, so every eighth tick is once every two seconds - enough for a
+// topmost window, and it keeps the poll loop cheap.
+const POLL_TICKS_PER_REFRESH: u32 = 8;
 // How long Windows may take to apply a layout change request.
 const OSD_SWITCH_TIMEOUT_MS: u32 = 1000;
 const OSD_PREVIEW_HOTKEY_ID: i32 = 1;
@@ -107,10 +108,10 @@ const OSD_CORNER_BOTTOM: u16 = 8;
 const OSD_MODE_FLAGS: u16 = 0;
 const OSD_MODE_TEXT: u16 = 1;
 const OSD_MODE_BOTH: u16 = 2;
-const OSD_DURATION_FAST: u16 = 0;
-const OSD_DURATION_NORMAL: u16 = 1;
-const OSD_DURATION_SLOW: u16 = 2;
-const OSD_DURATION_VERY_SLOW: u16 = 3;
+const OSD_DURATION_VERY_FAST: u16 = 0;
+const OSD_DURATION_FAST: u16 = 1;
+const OSD_DURATION_NORMAL: u16 = 2;
+const OSD_DURATION_SLOW: u16 = 3;
 const MAX_OSD_WINDOWS: usize = 16;
 const OSD_RADIUS: i32 = 16;
 const OSD_FILL_ALPHA: u8 = 222;
@@ -384,16 +385,16 @@ fn osd_width_for(mode: u16, size_percent: u16) -> i32 {
 /// How long the OSD stays on screen before it fades out.
 fn osd_display_ms(duration: u16) -> u32 {
     match duration {
+        OSD_DURATION_VERY_FAST => 700,
         OSD_DURATION_FAST => 1500,
-        OSD_DURATION_SLOW => 6000,
-        OSD_DURATION_VERY_SLOW => 12000,
-        _ => 3000,
+        OSD_DURATION_SLOW => 4000,
+        _ => 2500,
     }
 }
 
 fn valid_osd_duration(value: u16) -> u16 {
     match value {
-        OSD_DURATION_FAST | OSD_DURATION_NORMAL | OSD_DURATION_SLOW | OSD_DURATION_VERY_SLOW => {
+        OSD_DURATION_VERY_FAST | OSD_DURATION_FAST | OSD_DURATION_NORMAL | OSD_DURATION_SLOW => {
             value
         }
         _ => OSD_DURATION_NORMAL,
@@ -414,10 +415,10 @@ fn osd_size_options() -> [(&'static str, u16); 4] {
 
 fn osd_duration_options() -> [(&'static str, u16); 4] {
     [
+        ("Очень быстрое исчезновение", OSD_DURATION_VERY_FAST),
         ("Быстрое исчезновение", OSD_DURATION_FAST),
         ("Обычное исчезновение", OSD_DURATION_NORMAL),
         ("Медленное исчезновение", OSD_DURATION_SLOW),
-        ("Очень медленное исчезновение", OSD_DURATION_VERY_SLOW),
     ]
 }
 
@@ -1848,6 +1849,71 @@ unsafe fn show_osd(language: u16) {
     );
 }
 
+/// Creates the OSD windows for every monitor and renders their first frame
+/// ahead of time. Called at start-up and after an OSD setting change, so the
+/// first switch of a session never pays for window creation and the expensive
+/// per-pixel glass rendering - that delay was most visible on a second monitor,
+/// where the window had to be created and painted on the switch itself.
+unsafe fn prewarm_osd() {
+    let language = foreground_language();
+    let mode = OSD_MODE.load(Ordering::Relaxed);
+    let size_percent = OSD_SIZE_PERCENT.load(Ordering::Relaxed);
+    let base_width = osd_width_for(mode, size_percent);
+    let base_height = base_width / 3;
+    let corner = OSD_CORNER.load(Ordering::Relaxed);
+
+    let mut state = OsdEnumState {
+        monitors: [null_mut(); MAX_OSD_WINDOWS],
+        count: 0,
+    };
+    EnumDisplayMonitors(
+        null_mut(),
+        null(),
+        Some(collect_osd_monitors),
+        &mut state as *mut _ as isize,
+    );
+
+    let geometry_key = ((mode as u64) << 48) | ((size_percent as u64) << 32);
+    for (index, monitor) in state.monitors[..state.count].iter().copied().enumerate() {
+        let window = osd_window(index);
+        if window.is_null() {
+            continue;
+        }
+        let Some(work) = osd_work_area(monitor) else {
+            continue;
+        };
+        let scale = monitor_dpi(monitor) as f32 / 96.0;
+        let width = (base_width as f32 * scale).round() as i32;
+        let height = (base_height as f32 * scale).round() as i32;
+        let key = geometry_key | ((monitor as u64) & 0xffff_ffff) | ((corner as u64) << 24);
+        if OSD_WINDOW_GEOMETRY[index].swap(key, Ordering::Relaxed) != key {
+            let custom = custom_position(
+                OSD_CUSTOM_ENABLED.load(Ordering::Relaxed),
+                OSD_CUSTOM_X[index].load(Ordering::Relaxed),
+                OSD_CUSTOM_Y[index].load(Ordering::Relaxed),
+                width,
+                height,
+                work,
+            );
+            let (x, y) = custom.unwrap_or_else(|| osd_position(corner, work, width, height));
+            place_osd(
+                window,
+                x,
+                y,
+                width,
+                height,
+                (OSD_RADIUS as f32 * scale) as i32,
+            );
+        }
+        OSD_WINDOW_LANGUAGE[index].store(flag_language(language), Ordering::Relaxed);
+        // Render the frame now (glass, flag, text) while the OSD is hidden, so
+        // the first real show is just a copy and a flush.
+        let _ = prepare_frame(index, width, height, flag_language(language), 1000)
+            .map(|(frame, dc)| release_frame(frame, dc));
+        ShowWindow(window, SW_HIDE);
+    }
+}
+
 /// Paints one window on its own, using the language that window shows. The
 /// windows can sit on monitors with different foreground windows, so the
 /// shared language is only a fallback for the very first frame.
@@ -2674,6 +2740,9 @@ unsafe fn handle_command(window: HWND, command: usize) {
             if let Some(percent) = osd_size_from_id(command) {
                 OSD_SIZE_PERCENT.store(percent, Ordering::Relaxed);
                 write_setting("OsdSize", percent as u32);
+                // Pre-render the new size so the next switch does not pay for
+                // the resized glass rendering on screen.
+                prewarm_osd();
             }
         }
         OSD_CUSTOM_POS_ID => {
@@ -2849,6 +2918,9 @@ fn main() {
         if read_setting("FloatingWindow", 0) != 0 {
             set_floating(true);
         }
+        // Create the OSD windows and render their first frame now, so the very
+        // first layout switch - including on a second monitor - is instant.
+        prewarm_osd();
 
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0);
         if hook.is_null() {
@@ -3133,6 +3205,9 @@ unsafe fn save_osd_custom_positions() {
             "OsdCustomEnabled",
             OSD_CUSTOM_ENABLED.load(Ordering::Relaxed) as u32,
         );
+        // Force the next show to re-apply the new position instead of trusting
+        // the cached geometry key (which still matched).
+        OSD_WINDOW_GEOMETRY[0].store(0, Ordering::Relaxed);
     }
 }
 
